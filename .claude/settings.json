@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install)",
+      "Bash(node -e \"require\\(''sharp''\\); console.log\\(''sharp OK''\\)\")",
+      "Bash(node -e \"require\\(''whatsapp-web.js''\\); console.log\\(''whatsapp-web.js OK''\\)\")",
+      "Bash(node -e \"require\\(''qrcode-terminal''\\); console.log\\(''qrcode-terminal OK''\\)\")"
+    ]
+  }
+}
