@@ -77,6 +77,7 @@ client.on('auth_failure', (msg) => {
 });
 
 client.on('message_create', async (msg) => {
+  if (msg.fromMe) return;
   if (msg.body.trim().toLowerCase() !== '!sticker') return;
   if (TARGET_GROUP_ID && msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
 
