@@ -1,6 +1,12 @@
 const http = require('http');
+const fs = require('fs');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
+
+// Remove stale Chromium lock files left by a previous container instance
+['SingletonLock', 'SingletonCookie', 'SingletonSocket'].forEach((f) => {
+  try { fs.unlinkSync(`.wwebjs_auth/session/${f}`); } catch (_) {}
+});
 
 // Set this to your group's ID after running the bot once (it will be printed below).
 // Example: '120363000000000000@g.us'
@@ -39,7 +45,7 @@ const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   },
 });
 
