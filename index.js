@@ -1,9 +1,39 @@
+const http = require('http');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcode = require('qrcode');
 
 // Set this to your group's ID after running the bot once (it will be printed below).
 // Example: '120363000000000000@g.us'
 const TARGET_GROUP_ID = '120363424943457623@g.us';
+
+let qrDataUrl = null;
+let botReady = false;
+
+// Serve the QR code as a web page so it can be scanned from the Railway URL
+const server = http.createServer(async (_req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+
+  if (botReady) {
+    res.end('<html><body style="font-family:sans-serif;text-align:center;padding:50px"><h1>Bot is connected and running!</h1></body></html>');
+    return;
+  }
+
+  if (!qrDataUrl) {
+    res.end('<html><body style="font-family:sans-serif;text-align:center;padding:50px"><h1>Waiting for QR code...</h1><meta http-equiv="refresh" content="3"></body></html>');
+    return;
+  }
+
+  res.end(`<html><body style="background:#111;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+    <div style="text-align:center">
+      <h2 style="color:white;font-family:sans-serif">Scan with WhatsApp to connect the bot</h2>
+      <img src="${qrDataUrl}" style="width:300px;height:300px;border-radius:12px">
+      <meta http-equiv="refresh" content="30">
+    </div>
+  </body></html>`);
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`QR server listening on port ${PORT}`));
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -13,12 +43,14 @@ const client = new Client({
   },
 });
 
-client.on('qr', (qr) => {
-  qrcode.generate(qr, { small: true });
-  console.log('QR code generated. Scan it with WhatsApp on your phone.');
+client.on('qr', async (qr) => {
+  qrDataUrl = await qrcode.toDataURL(qr);
+  console.log('QR code ready. Open the app URL in your browser to scan it.');
 });
 
 client.on('ready', async () => {
+  botReady = true;
+  qrDataUrl = null;
   console.log('Bot is ready!');
 
   if (!TARGET_GROUP_ID) {
