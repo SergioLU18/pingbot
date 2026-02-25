@@ -7,7 +7,10 @@ const TARGET_GROUP_ID = '120363424943457623@g.us';
 
 const client = new Client({
   authStrategy: new LocalAuth(),
-  puppeteer: { args: ['--no-sandbox'] },
+  puppeteer: {
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  },
 });
 
 client.on('qr', (qr) => {
