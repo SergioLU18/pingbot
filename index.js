@@ -12,6 +12,38 @@ const qrcode = require('qrcode');
 // Example: '120363000000000000@g.us'
 const TARGET_GROUP_ID = '120363424943457623@g.us';
 
+// Optional: get a push notification on your phone when the bot disconnects.
+// 1. Install the ntfy app (ntfy.sh) on your phone
+// 2. Subscribe to a topic name of your choice (e.g. 'pingbot-alerts-yourname')
+// 3. Set NTFY_TOPIC to that topic name as a Railway environment variable
+const NTFY_TOPIC = process.env.NTFY_TOPIC || null;
+
+async function notify(message) {
+  if (!NTFY_TOPIC) return;
+  try {
+    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, { method: 'POST', body: message });
+  } catch (_) {}
+}
+
+const RATE_LIMIT = 5;        // max stickers per window
+const RATE_WINDOW_MS = 60_000; // 1 minute
+const rateLimits = new Map(); // userId -> { count, resetAt }
+
+function isRateLimited(userId) {
+  const now = Date.now();
+  const entry = rateLimits.get(userId);
+
+  if (!entry || now >= entry.resetAt) {
+    rateLimits.set(userId, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    return false;
+  }
+
+  if (entry.count >= RATE_LIMIT) return true;
+
+  entry.count++;
+  return false;
+}
+
 let qrDataUrl = null;
 let botReady = false;
 
@@ -72,14 +104,25 @@ client.on('ready', async () => {
   }
 });
 
-client.on('auth_failure', (msg) => {
+client.on('disconnected', async (reason) => {
+  botReady = false;
+  console.warn('Bot disconnected:', reason);
+  await notify(`PingBot disconnected: ${reason}. Open the app URL to re-scan the QR code.`);
+});
+
+client.on('auth_failure', async (msg) => {
   console.error('Authentication failed:', msg);
+  await notify(`PingBot auth failure: ${msg}`);
 });
 
 client.on('message_create', async (msg) => {
   if (msg.fromMe) return;
   if (msg.body.trim().toLowerCase() !== '!sticker') return;
   if (TARGET_GROUP_ID && msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
+  if (isRateLimited(msg.author || msg.from)) {
+    await msg.reply('You\'ve reached the limit of 5 stickers per minute. Try again shortly.');
+    return;
+  }
 
   let media = null;
 
