@@ -122,7 +122,10 @@ client.on('ready', async () => {
 client.on('disconnected', async (reason) => {
   botReady = false;
   console.warn('Bot disconnected:', reason);
-  await notify(`PingBot disconnected: ${reason}. Open the app URL to re-scan the QR code.`);
+  await notify(`PingBot disconnected: ${reason}. Restarting…`);
+  // Exit so Railway restarts the container and reconnects automatically.
+  // Requires a persistent volume mounted at /app/.wwebjs_auth to avoid re-scanning QR.
+  process.exit(1);
 });
 
 client.on('auth_failure', async (msg) => {
