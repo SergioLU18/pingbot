@@ -29,6 +29,13 @@ const RATE_LIMIT = 5;        // max stickers per window
 const RATE_WINDOW_MS = 60_000; // 1 minute
 const rateLimits = new Map(); // userId -> { count, resetAt }
 
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, entry] of rateLimits) {
+    if (now >= entry.resetAt) rateLimits.delete(userId);
+  }
+}, RATE_WINDOW_MS);
+
 function isRateLimited(userId) {
   const now = Date.now();
   const entry = rateLimits.get(userId);
@@ -77,7 +84,15 @@ const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--single-process',
+      '--no-zygote',
+    ],
   },
 });
 
