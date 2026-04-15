@@ -90,8 +90,31 @@ const client = new Client({
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--disable-extensions',
-      '--single-process',
       '--no-zygote',
+      // Reduce background CPU/network activity
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-sync',
+      '--disable-default-apps',
+      '--no-first-run',
+      '--no-pings',
+      // Cap disk and media caches to ~32 MB each
+      '--disk-cache-size=33554432',
+      '--media-cache-size=33554432',
+      // Cap V8 heap to 512 MB so Chrome doesn't grow unbounded
+      '--js-flags=--max-old-space-size=512',
+      // Misc hardening
+      '--mute-audio',
+      '--disable-notifications',
+      '--disable-breakpad',
+      '--disable-client-side-phishing-detection',
+      '--disable-component-extensions-with-background-pages',
+      '--disable-domain-reliability',
+      '--metrics-recording-only',
+      '--password-store=basic',
+      '--use-mock-keychain',
     ],
   },
 });
@@ -164,5 +187,22 @@ client.on('message_create', async (msg) => {
     stickerAuthor: 'ChichenIT',
   });
 });
+
+// Schedule a daily restart at 04:00 UTC to prevent Chromium memory buildup.
+// Railway will automatically restart the container on exit.
+function scheduleRestart() {
+  const now = new Date();
+  const next = new Date();
+  next.setUTCHours(4, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  const msUntil = next - now;
+  console.log(`Scheduled restart in ${Math.round(msUntil / 60000)} min (04:00 UTC)`);
+  setTimeout(async () => {
+    console.log('Performing scheduled daily restart to reclaim memory…');
+    await notify('PingBot: scheduled daily restart to reclaim memory.');
+    process.exit(0);
+  }, msUntil);
+}
+scheduleRestart();
 
 client.initialize();
