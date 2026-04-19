@@ -205,7 +205,7 @@ function scheduleRestart() {
   setTimeout(async () => {
     console.log('Performing scheduled daily restart to reclaim memory…');
     await notify('PingBot: scheduled daily restart to reclaim memory.');
-    process.exit(0);
+    process.exit(1);
   }, msUntil);
 }
 scheduleRestart();
