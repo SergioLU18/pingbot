@@ -104,7 +104,8 @@ const client = new Client({
       '--disk-cache-size=33554432',
       '--media-cache-size=33554432',
       // Cap V8 heap to 512 MB so Chrome doesn't grow unbounded
-      '--js-flags=--max-old-space-size=512',
+      '--js-flags=--max-old-space-size=256',
+      '--renderer-process-limit=1',
       // Misc hardening
       '--mute-audio',
       '--disable-notifications',
@@ -205,6 +206,7 @@ function scheduleRestart() {
   setTimeout(async () => {
     console.log('Performing scheduled daily restart to reclaim memory…');
     await notify('PingBot: scheduled daily restart to reclaim memory.');
+    try { await client.destroy(); } catch (_) {}
     process.exit(1);
   }, msUntil);
 }
