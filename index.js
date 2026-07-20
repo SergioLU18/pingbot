@@ -162,6 +162,21 @@ client.on('auth_failure', async (msg) => {
   await notify(`PingBot auth failure: ${msg}`);
 });
 
+// Errors that cross the puppeteer page boundary lose most of their detail and
+// their class names are minified. Print every own property so the cause is visible.
+function describeError(err) {
+  if (!err) return String(err);
+  const parts = [`${err.name || 'Error'}: ${err.message || '(no message)'}`];
+  for (const key of Object.getOwnPropertyNames(err)) {
+    if (key === 'name' || key === 'message' || key === 'stack') continue;
+    let value;
+    try { value = JSON.stringify(err[key]); } catch (_) { value = '(unserializable)'; }
+    parts.push(`${key}=${value}`);
+  }
+  if (err.stack) parts.push(`\n${err.stack}`);
+  return parts.join(' ');
+}
+
 // Safely reply without letting a send failure bubble up as an unhandled rejection.
 async function safeReply(msg, content, options) {
   try {
@@ -193,9 +208,9 @@ client.on('message_create', async (msg) => {
         }
       }
     } catch (err) {
-      // WhatsApp returns a minified error ("r: r") when the media is no longer
-      // available on its servers, or when the page context changed mid-download.
-      console.warn('Media download failed:', err && err.message);
+      // Errors thrown inside the WhatsApp Web page are minified, so err.message
+      // is often just "r". Dump everything we can to make it diagnosable.
+      console.warn('Media download failed:', describeError(err));
       await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
       return;
     }

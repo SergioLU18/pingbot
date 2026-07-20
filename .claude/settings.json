@@ -5,7 +5,13 @@
       "Bash(node -e \"require\\(''sharp''\\); console.log\\(''sharp OK''\\)\")",
       "Bash(node -e \"require\\(''whatsapp-web.js''\\); console.log\\(''whatsapp-web.js OK''\\)\")",
       "Bash(node -e \"require\\(''qrcode-terminal''\\); console.log\\(''qrcode-terminal OK''\\)\")",
-      "Bash(node --check index.js)"
+      "Bash(node --check index.js)",
+      "Bash(node -e \"console.log\\(require\\('./node_modules/whatsapp-web.js/package.json'\\).version\\)\")",
+      "Bash(npm view *)",
+      "Bash(npm pack *)",
+      "Bash(tar xzf *)",
+      "Bash(mkdir -p v7)",
+      "Bash(npm install *)"
     ]
   }
 }
