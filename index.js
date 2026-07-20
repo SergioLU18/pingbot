@@ -217,6 +217,24 @@ async function probeWhatsAppPage() {
   }
 }
 
+// WhatsApp's message keys reach us in several shapes, and current versions no
+// longer include `_serialized` on the object hung off a Message. Rebuild it from
+// its parts when it's missing: fromMe_remote_id[_participant].
+function serializeMsgId(id) {
+  if (!id) return null;
+  if (typeof id === 'string') return id;
+  if (id._serialized) return id._serialized;
+
+  const flatten = (v) => (v && typeof v === 'object' ? v._serialized : v);
+  const remote = flatten(id.remote);
+  if (!remote || !id.id) return null;
+
+  const parts = [id.fromMe ? 'true' : 'false', remote, id.id];
+  const participant = flatten(id.participant);
+  if (participant) parts.push(participant);
+  return parts.join('_');
+}
+
 // Resolves a reply to the ID of the message it quotes.
 //
 // We deliberately avoid the library's getQuotedMessage(): it ends by calling
@@ -230,6 +248,11 @@ async function getQuotedMediaId(msgId) {
     try {
       step.at = 'require(WAWebCollections)';
       const Collections = window.require('WAWebCollections');
+
+      step.at = 'validate id';
+      if (typeof id !== 'string' || !id) {
+        return { ok: false, reason: `bad message id: ${JSON.stringify(id)}`, step };
+      }
 
       step.at = 'Msg.get';
       let m = Collections.Msg.get(id);
@@ -248,9 +271,23 @@ async function getQuotedMediaId(msgId) {
       if (!quoted) return { ok: false, reason: 'no quoted message', step };
 
       step.at = 'read quoted id';
+      const flatten = (v) => (v && typeof v === 'object' ? v._serialized : v);
+      const qid = quoted.id;
+      let serialized = null;
+      if (typeof qid === 'string') {
+        serialized = qid;
+      } else if (qid && qid._serialized) {
+        serialized = qid._serialized;
+      } else if (qid && flatten(qid.remote) && qid.id) {
+        const parts = [qid.fromMe ? 'true' : 'false', flatten(qid.remote), qid.id];
+        if (flatten(qid.participant)) parts.push(flatten(qid.participant));
+        serialized = parts.join('_');
+      }
+
       return {
         ok: true,
-        id: quoted.id && quoted.id._serialized,
+        id: serialized,
+        idShape: qid ? Object.keys(qid).join(',') : String(qid),
         type: quoted.type,
         hasMedia: Boolean(quoted.mediaData || quoted.mediaKey),
       };
@@ -336,7 +373,7 @@ async function downloadMediaVerbose(msgId) {
         },
       };
     }
-  }, msg.id._serialized);
+  }, msgId);
 }
 
 // Safely reply without letting a send failure bubble up as an unhandled rejection.
@@ -360,10 +397,23 @@ client.on('message_create', async (msg) => {
 
     // Work in terms of message IDs, not Message objects. Building a Message means
     // going through WWebJS.getMessageModel(), which is the part that throws.
-    let sourceId = msg.hasMedia ? msg.id._serialized : null;
+    const ownId = serializeMsgId(msg.id);
+
+    if (!ownId) {
+      console.warn('Could not derive an id for the incoming message:', JSON.stringify({
+        id: msg.id,
+        hasMedia: msg.hasMedia,
+        hasQuotedMsg: msg.hasQuotedMsg,
+        dataIdShape: msg._data && msg._data.id ? Object.keys(msg._data.id).join(',') : null,
+      }, null, 2));
+      await safeReply(msg, 'Something went wrong reading that message. Try again.');
+      return;
+    }
+
+    let sourceId = msg.hasMedia ? ownId : null;
 
     if (!sourceId && msg.hasQuotedMsg) {
-      const quoted = await getQuotedMediaId(msg.id._serialized);
+      const quoted = await getQuotedMediaId(ownId);
       if (!quoted.ok || !quoted.id) {
         console.warn('Could not resolve quoted message:', JSON.stringify(quoted, null, 2));
         await safeReply(msg, 'I couldn\'t read the message you replied to. Try sending the image directly with *!sticker* as the caption.');

@@ -18,7 +18,11 @@
       "Bash(curl -s \"https://api.github.com/repos/pedroslopez/whatsapp-web.js/commits?sha=main&per_page=15\")",
       "Bash(curl -sL \"https://api.github.com/repos/pedroslopez/whatsapp-web.js\")",
       "Bash(curl -s \"https://api.github.com/repos/wwebjs/whatsapp-web.js/commits?sha=main&per_page=20\")",
-      "Bash(curl -sL \"https://raw.githubusercontent.com/wwebjs/whatsapp-web.js/main/src/structures/Message.js\" -o main-Message.js)"
+      "Bash(curl -sL \"https://raw.githubusercontent.com/wwebjs/whatsapp-web.js/main/src/structures/Message.js\" -o main-Message.js)",
+      "Bash(python3 -)",
+      "Bash(npx --yes eslint --no-eslintrc --env es2022,node,browser --parser-options ecmaVersion:2022 --rule '{\"no-undef\":\"error\",\"no-unused-vars\":\"warn\"}' index.js)",
+      "Bash(cp /private/tmp/claude-501/-Users-sergio-Documents-ChichenIT-pingbot/bc2cb2c9-bc73-415f-aea8-3b1d7fedc8b0/scratchpad/eslint.config.mjs /tmp/ec.mjs)",
+      "Bash(npx --yes eslint@9 -c /private/tmp/claude-501/-Users-sergio-Documents-ChichenIT-pingbot/bc2cb2c9-bc73-415f-aea8-3b1d7fedc8b0/scratchpad/eslint.config.mjs index.js)"
     ]
   }
 }
