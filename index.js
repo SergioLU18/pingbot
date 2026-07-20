@@ -1,6 +1,6 @@
 const http = require('http');
 const fs = require('fs');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 
 // Remove stale Chromium lock files left by a previous container instance
@@ -130,6 +130,8 @@ client.on('ready', async () => {
   qrDataUrl = null;
   console.log('Bot is ready!');
 
+  await probeWhatsAppPage();
+
   if (!TARGET_GROUP_ID) {
     const chats = await client.getChats();
     const groups = chats.filter((c) => c.isGroup);
@@ -177,6 +179,111 @@ function describeError(err) {
   return parts.join(' ');
 }
 
+// Modules whatsapp-web.js pulls out of the WhatsApp Web bundle for our two code
+// paths. If WhatsApp renames or drops one, window.require throws a minified error.
+const REQUIRED_MODULES = [
+  'WAWebCollections',
+  'WAWebQuotedMsgModelUtils',
+  'WAWebDownloadManager',
+];
+
+// Runs once the page is live: reports the served WhatsApp Web version and whether
+// each module the library depends on still resolves.
+async function probeWhatsAppPage() {
+  try {
+    const report = await client.pupPage.evaluate((mods) => {
+      const out = {
+        waVersion: (window.Debug && window.Debug.VERSION) || '(unknown)',
+        typeofRequire: typeof window.require,
+        typeofWWebJS: typeof window.WWebJS,
+        modules: {},
+      };
+      for (const name of mods) {
+        try {
+          const mod = window.require(name);
+          out.modules[name] = mod
+            ? `ok [${Object.keys(mod).slice(0, 6).join(', ')}]`
+            : 'resolved but empty';
+        } catch (e) {
+          out.modules[name] = `THREW ${e && e.name}: ${e && e.message}`;
+        }
+      }
+      return out;
+    }, REQUIRED_MODULES);
+    console.log('WhatsApp Web page probe:', JSON.stringify(report, null, 2));
+  } catch (err) {
+    console.warn('Page probe failed:', describeError(err));
+  }
+}
+
+// Mirrors the library's downloadMedia, but catches inside the page so the real
+// (un-minified) error message and stack survive instead of collapsing to "r".
+async function downloadMediaVerbose(msg) {
+  return client.pupPage.evaluate(async (msgId) => {
+    const step = { at: 'start' };
+    try {
+      step.at = 'require(WAWebCollections)';
+      const Collections = window.require('WAWebCollections');
+
+      step.at = 'Msg.get';
+      let m = Collections.Msg.get(msgId);
+      if (!m) {
+        step.at = 'Msg.getMessagesById';
+        m = (await Collections.Msg.getMessagesById([msgId]))?.messages?.[0];
+      }
+      if (!m) return { ok: false, reason: 'message not found in store', step };
+
+      step.at = 'read mediaData';
+      step.mediaStage = m.mediaData && m.mediaData.mediaStage;
+      step.type = m.type;
+      if (!m.mediaData) return { ok: false, reason: 'no mediaData', step };
+
+      if (step.mediaStage !== 'RESOLVED') {
+        step.at = 'msg.downloadMedia (resolve)';
+        await m.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+        step.mediaStageAfterResolve = m.mediaData.mediaStage;
+      }
+
+      step.at = 'require(WAWebDownloadManager)';
+      const dm = window.require('WAWebDownloadManager').downloadManager;
+
+      step.at = 'downloadAndMaybeDecrypt';
+      const mockQpl = {
+        addAnnotations() { return this; },
+        addPoint() { return this; },
+      };
+      const decrypted = await dm.downloadAndMaybeDecrypt({
+        directPath: m.directPath,
+        encFilehash: m.encFilehash,
+        filehash: m.filehash,
+        mediaKey: m.mediaKey,
+        mediaKeyTimestamp: m.mediaKeyTimestamp,
+        type: m.type,
+        signal: new AbortController().signal,
+        downloadQpl: mockQpl,
+      });
+
+      step.at = 'arrayBufferToBase64Async';
+      const data = await window.WWebJS.arrayBufferToBase64Async(decrypted);
+
+      return { ok: true, data, mimetype: m.mimetype, filename: m.filename, filesize: m.size };
+    } catch (e) {
+      return {
+        ok: false,
+        reason: 'threw',
+        step,
+        error: {
+          name: e && e.name,
+          message: e && e.message,
+          status: e && e.status,
+          stack: e && e.stack ? String(e.stack).split('\n').slice(0, 6).join(' | ') : null,
+          keys: e ? Object.getOwnPropertyNames(e).join(',') : null,
+        },
+      };
+    }
+  }, msg.id._serialized);
+}
+
 // Safely reply without letting a send failure bubble up as an unhandled rejection.
 async function safeReply(msg, content, options) {
   try {
@@ -196,27 +303,51 @@ client.on('message_create', async (msg) => {
       return;
     }
 
-    let media = null;
+    // The message carrying the media: either this one, or the one it replies to.
+    let source = msg.hasMedia ? msg : null;
 
-    try {
-      if (msg.hasMedia) {
-        media = await msg.downloadMedia();
-      } else if (msg.hasQuotedMsg) {
+    if (!source && msg.hasQuotedMsg) {
+      try {
         const quoted = await msg.getQuotedMessage();
-        if (quoted && quoted.hasMedia) {
-          media = await quoted.downloadMedia();
-        }
+        if (quoted && quoted.hasMedia) source = quoted;
+      } catch (err) {
+        console.warn('getQuotedMessage failed:', describeError(err));
+        await safeReply(msg, 'I couldn\'t read the message you replied to. Try sending the image directly with *!sticker* as the caption.');
+        return;
       }
-    } catch (err) {
-      // Errors thrown inside the WhatsApp Web page are minified, so err.message
-      // is often just "r". Dump everything we can to make it diagnosable.
-      console.warn('Media download failed:', describeError(err));
-      await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
+    }
+
+    if (!source) {
+      await safeReply(msg, 'Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.');
       return;
     }
 
+    let media = null;
+
+    try {
+      media = await source.downloadMedia();
+    } catch (err) {
+      // The library's downloadMedia lets page errors escape as minified junk ("r").
+      // Retry with our own copy, which catches in-page and reports the real cause.
+      console.warn('downloadMedia failed:', describeError(err));
+      const detail = await downloadMediaVerbose(source).catch((e) => ({
+        ok: false, reason: 'verbose path also threw', error: describeError(e),
+      }));
+
+      if (detail && detail.ok) {
+        media = new MessageMedia(detail.mimetype, detail.data, detail.filename, detail.filesize);
+      } else {
+        console.warn('Media download diagnostics:', JSON.stringify(detail, null, 2));
+        await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
+        return;
+      }
+    }
+
+    // downloadMedia resolves to undefined (rather than throwing) when WhatsApp no
+    // longer has the file — typically an old message whose media has expired.
     if (!media) {
-      await safeReply(msg, 'Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.');
+      console.warn('downloadMedia returned no media for', source.id._serialized);
+      await safeReply(msg, 'That image is no longer available on WhatsApp. Send it again as a new message.');
       return;
     }
 

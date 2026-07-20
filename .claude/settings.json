@@ -11,7 +11,14 @@
       "Bash(npm pack *)",
       "Bash(tar xzf *)",
       "Bash(mkdir -p v7)",
-      "Bash(npm install *)"
+      "Bash(npm install *)",
+      "Bash(curl -s \"https://api.github.com/repos/wppconnect-team/wa-version/contents/html\")",
+      "Bash(curl -s \"https://api.github.com/repos/wppconnect-team/wa-version/contents/html?per_page=100\")",
+      "Bash(curl -s \"https://api.github.com/repos/wppconnect-team/wa-version/contents/html?per_page=100&page=1\")",
+      "Bash(curl -s \"https://api.github.com/repos/pedroslopez/whatsapp-web.js/commits?sha=main&per_page=15\")",
+      "Bash(curl -sL \"https://api.github.com/repos/pedroslopez/whatsapp-web.js\")",
+      "Bash(curl -s \"https://api.github.com/repos/wwebjs/whatsapp-web.js/commits?sha=main&per_page=20\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/wwebjs/whatsapp-web.js/main/src/structures/Message.js\" -o main-Message.js)"
     ]
   }
 }
