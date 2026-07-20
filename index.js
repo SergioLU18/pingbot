@@ -216,9 +216,57 @@ async function probeWhatsAppPage() {
   }
 }
 
+// Resolves a reply to the ID of the message it quotes.
+//
+// We deliberately avoid the library's getQuotedMessage(): it ends by calling
+// WWebJS.getMessageModel(), which runs message.serialize(), link parsing and
+// button serialization to build a full Message object. That is a lot of surface
+// for data we don't need, and something in it throws a minified error ("r").
+// All we want is the ID, which we then hand straight to the downloader.
+async function getQuotedMediaId(msgId) {
+  return client.pupPage.evaluate(async (id) => {
+    const step = { at: 'start' };
+    try {
+      step.at = 'require(WAWebCollections)';
+      const Collections = window.require('WAWebCollections');
+
+      step.at = 'Msg.get';
+      let m = Collections.Msg.get(id);
+      if (!m) {
+        step.at = 'Msg.getMessagesById';
+        m = (await Collections.Msg.getMessagesById([id]))?.messages?.[0];
+      }
+      if (!m) return { ok: false, reason: 'message not found in store', step };
+
+      step.at = 'getQuotedMsgObj';
+      const quoted = window.require('WAWebQuotedMsgModelUtils').getQuotedMsgObj(m);
+      if (!quoted) return { ok: false, reason: 'no quoted message', step };
+
+      step.at = 'read quoted id';
+      return {
+        ok: true,
+        id: quoted.id && quoted.id._serialized,
+        type: quoted.type,
+        hasMedia: Boolean(quoted.mediaData || quoted.mediaKey),
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        reason: 'threw',
+        step,
+        error: {
+          name: e && e.name,
+          message: e && e.message,
+          stack: e && e.stack ? String(e.stack).split('\n').slice(0, 6).join(' | ') : null,
+        },
+      };
+    }
+  }, msgId);
+}
+
 // Mirrors the library's downloadMedia, but catches inside the page so the real
 // (un-minified) error message and stack survive instead of collapsing to "r".
-async function downloadMediaVerbose(msg) {
+async function downloadMediaVerbose(msgId) {
   return client.pupPage.evaluate(async (msgId) => {
     const step = { at: 'start' };
     try {
@@ -303,53 +351,38 @@ client.on('message_create', async (msg) => {
       return;
     }
 
-    // The message carrying the media: either this one, or the one it replies to.
-    let source = msg.hasMedia ? msg : null;
+    // Work in terms of message IDs, not Message objects. Building a Message means
+    // going through WWebJS.getMessageModel(), which is the part that throws.
+    let sourceId = msg.hasMedia ? msg.id._serialized : null;
 
-    if (!source && msg.hasQuotedMsg) {
-      try {
-        const quoted = await msg.getQuotedMessage();
-        if (quoted && quoted.hasMedia) source = quoted;
-      } catch (err) {
-        console.warn('getQuotedMessage failed:', describeError(err));
+    if (!sourceId && msg.hasQuotedMsg) {
+      const quoted = await getQuotedMediaId(msg.id._serialized);
+      if (!quoted.ok || !quoted.id) {
+        console.warn('Could not resolve quoted message:', JSON.stringify(quoted, null, 2));
         await safeReply(msg, 'I couldn\'t read the message you replied to. Try sending the image directly with *!sticker* as the caption.');
         return;
       }
+      if (!quoted.hasMedia) {
+        await safeReply(msg, 'That message doesn\'t have an image. Reply to an image with *!sticker*.');
+        return;
+      }
+      sourceId = quoted.id;
     }
 
-    if (!source) {
+    if (!sourceId) {
       await safeReply(msg, 'Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.');
       return;
     }
 
-    let media = null;
+    const result = await downloadMediaVerbose(sourceId);
 
-    try {
-      media = await source.downloadMedia();
-    } catch (err) {
-      // The library's downloadMedia lets page errors escape as minified junk ("r").
-      // Retry with our own copy, which catches in-page and reports the real cause.
-      console.warn('downloadMedia failed:', describeError(err));
-      const detail = await downloadMediaVerbose(source).catch((e) => ({
-        ok: false, reason: 'verbose path also threw', error: describeError(e),
-      }));
-
-      if (detail && detail.ok) {
-        media = new MessageMedia(detail.mimetype, detail.data, detail.filename, detail.filesize);
-      } else {
-        console.warn('Media download diagnostics:', JSON.stringify(detail, null, 2));
-        await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
-        return;
-      }
-    }
-
-    // downloadMedia resolves to undefined (rather than throwing) when WhatsApp no
-    // longer has the file — typically an old message whose media has expired.
-    if (!media) {
-      console.warn('downloadMedia returned no media for', source.id._serialized);
-      await safeReply(msg, 'That image is no longer available on WhatsApp. Send it again as a new message.');
+    if (!result || !result.ok) {
+      console.warn('Media download failed:', JSON.stringify(result, null, 2));
+      await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
       return;
     }
+
+    const media = new MessageMedia(result.mimetype, result.data, result.filename, result.filesize);
 
     await safeReply(msg, media, {
       sendMediaAsSticker: true,
