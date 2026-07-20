@@ -185,6 +185,7 @@ const REQUIRED_MODULES = [
   'WAWebCollections',
   'WAWebQuotedMsgModelUtils',
   'WAWebDownloadManager',
+  'WAWebMsgKey',
 ];
 
 // Runs once the page is live: reports the served WhatsApp Web version and whether
@@ -234,7 +235,11 @@ async function getQuotedMediaId(msgId) {
       let m = Collections.Msg.get(id);
       if (!m) {
         step.at = 'Msg.getMessagesById';
-        m = (await Collections.Msg.getMessagesById([id]))?.messages?.[0];
+        // getMessagesById indexes IndexedDB by MsgKey object, not by the
+        // serialized string — passing the string looks up an undefined key
+        // and IndexedDB throws DataError.
+        const key = window.require('WAWebMsgKey').fromString(id);
+        m = (await Collections.Msg.getMessagesById([key]))?.messages?.[0];
       }
       if (!m) return { ok: false, reason: 'message not found in store', step };
 
@@ -277,7 +282,9 @@ async function downloadMediaVerbose(msgId) {
       let m = Collections.Msg.get(msgId);
       if (!m) {
         step.at = 'Msg.getMessagesById';
-        m = (await Collections.Msg.getMessagesById([msgId]))?.messages?.[0];
+        // Must be a MsgKey object — see the note in getQuotedMediaId.
+        const key = window.require('WAWebMsgKey').fromString(msgId);
+        m = (await Collections.Msg.getMessagesById([key]))?.messages?.[0];
       }
       if (!m) return { ok: false, reason: 'message not found in store', step };
 
