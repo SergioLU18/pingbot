@@ -162,36 +162,67 @@ client.on('auth_failure', async (msg) => {
   await notify(`PingBot auth failure: ${msg}`);
 });
 
+// Safely reply without letting a send failure bubble up as an unhandled rejection.
+async function safeReply(msg, content, options) {
+  try {
+    await msg.reply(content, null, options);
+  } catch (err) {
+    console.warn('Failed to reply:', err && err.message);
+  }
+}
+
 client.on('message_create', async (msg) => {
-  if (msg.fromMe) return;
-  if (msg.body.trim().toLowerCase() !== '!sticker') return;
-  if (TARGET_GROUP_ID && msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
-  if (isRateLimited(msg.author || msg.from)) {
-    await msg.reply('You\'ve reached the limit of 5 stickers per minute. Try again shortly.');
-    return;
-  }
-
-  let media = null;
-
-  if (msg.hasMedia) {
-    media = await msg.downloadMedia();
-  } else if (msg.hasQuotedMsg) {
-    const quoted = await msg.getQuotedMessage();
-    if (quoted.hasMedia) {
-      media = await quoted.downloadMedia();
+  try {
+    if (msg.fromMe) return;
+    if (msg.body.trim().toLowerCase() !== '!sticker') return;
+    if (TARGET_GROUP_ID && msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
+    if (isRateLimited(msg.author || msg.from)) {
+      await safeReply(msg, 'You\'ve reached the limit of 5 stickers per minute. Try again shortly.');
+      return;
     }
-  }
 
-  if (!media) {
-    await msg.reply('Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.');
-    return;
-  }
+    let media = null;
 
-  await msg.reply(media, null, {
-    sendMediaAsSticker: true,
-    stickerName: 'PingBot',
-    stickerAuthor: 'ChichenIT',
-  });
+    try {
+      if (msg.hasMedia) {
+        media = await msg.downloadMedia();
+      } else if (msg.hasQuotedMsg) {
+        const quoted = await msg.getQuotedMessage();
+        if (quoted && quoted.hasMedia) {
+          media = await quoted.downloadMedia();
+        }
+      }
+    } catch (err) {
+      // WhatsApp returns a minified error ("r: r") when the media is no longer
+      // available on its servers, or when the page context changed mid-download.
+      console.warn('Media download failed:', err && err.message);
+      await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
+      return;
+    }
+
+    if (!media) {
+      await safeReply(msg, 'Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.');
+      return;
+    }
+
+    await safeReply(msg, media, {
+      sendMediaAsSticker: true,
+      stickerName: 'PingBot',
+      stickerAuthor: 'ChichenIT',
+    });
+  } catch (err) {
+    console.error('Error handling message:', err && err.stack);
+  }
+});
+
+// Last-resort guards. A rejected promise from puppeteer/whatsapp-web.js internals
+// should never take the whole bot down — log it and keep running.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason && (reason.stack || reason.message || reason));
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err && (err.stack || err.message));
 });
 
 // Schedule a daily restart at 04:00 UTC to prevent Chromium memory buildup.
