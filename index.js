@@ -3,10 +3,70 @@ const fs = require('fs');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 
+const path = require('path');
+
+// Chromium's user data dir, which LocalAuth points at and Railway mounts as a volume.
+const SESSION_DIR = path.join('.wwebjs_auth', 'session');
+
 // Remove stale Chromium lock files left by a previous container instance
 ['SingletonLock', 'SingletonCookie', 'SingletonSocket'].forEach((f) => {
-  try { fs.unlinkSync(`.wwebjs_auth/session/${f}`); } catch (_) {}
+  try { fs.unlinkSync(path.join(SESSION_DIR, f)); } catch (_) {}
 });
+
+// Caches Chromium rebuilds on demand. They survive restarts on the volume and get
+// paged back in at boot, so the RAM baseline ratchets upward with every restart
+// instead of returning to its floor. Nothing here is the WhatsApp session: the
+// auth credentials live in Default/IndexedDB and Default/Local Storage, which we
+// must leave alone or the bot logs out and needs a fresh QR scan.
+const DISPOSABLE_CACHES = [
+  'Default/Cache',
+  'Default/Code Cache',
+  'Default/GPUCache',
+  'Default/Service Worker/CacheStorage',
+  'Default/Service Worker/ScriptCache',
+  'Default/DawnGraphiteCache',
+  'Default/DawnWebGPUCache',
+  'GrShaderCache',
+  'ShaderCache',
+  'GraphiteDawnCache',
+];
+
+function dirSize(target) {
+  let total = 0;
+  let entries;
+  try {
+    entries = fs.readdirSync(target, { withFileTypes: true });
+  } catch (_) {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(target, entry.name);
+    if (entry.isDirectory()) {
+      total += dirSize(full);
+    } else {
+      try { total += fs.statSync(full).size; } catch (_) {}
+    }
+  }
+  return total;
+}
+
+function pruneDisposableCaches() {
+  let reclaimed = 0;
+  for (const rel of DISPOSABLE_CACHES) {
+    const target = path.join(SESSION_DIR, ...rel.split('/'));
+    if (!fs.existsSync(target)) continue;
+    const size = dirSize(target);
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      reclaimed += size;
+    } catch (err) {
+      console.warn(`Could not prune ${rel}:`, err && err.message);
+    }
+  }
+  console.log(`Pruned Chromium caches: reclaimed ${(reclaimed / 1048576).toFixed(1)} MB`);
+}
+
+pruneDisposableCaches();
 
 // Set this to your group's ID after running the bot once (it will be printed below).
 // Example: '120363000000000000@g.us'
@@ -21,7 +81,13 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC || null;
 async function notify(message) {
   if (!NTFY_TOPIC) return;
   try {
-    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, { method: 'POST', body: message });
+    // Bounded: notify() sits on the restart path, and a stalled POST here would
+    // hold up the exit it is announcing.
+    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+      method: 'POST',
+      body: message,
+      signal: AbortSignal.timeout(5000),
+    });
   } catch (_) {}
 }
 
@@ -103,7 +169,7 @@ const client = new Client({
       // Cap disk and media caches to ~32 MB each
       '--disk-cache-size=33554432',
       '--media-cache-size=33554432',
-      // Cap V8 heap to 512 MB so Chrome doesn't grow unbounded
+      // Cap V8 heap to 256 MB so Chrome doesn't grow unbounded
       '--js-flags=--max-old-space-size=256',
       '--renderer-process-limit=1',
       // Misc hardening
@@ -145,6 +211,37 @@ client.on('ready', async () => {
   }
 });
 
+// client.destroy() ends in puppeteer's browser.close(), which can hang forever on a
+// wedged Chromium. Anything sequenced after a bare `await client.destroy()` may then
+// never run. Always race it against a deadline.
+const DESTROY_TIMEOUT_MS = 10_000;
+
+async function destroyWithTimeout() {
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), DESTROY_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([client.destroy().then(() => true, () => false), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Exit no matter what, so Railway rebuilds the container from a clean slate.
+// The unref'd timer fires even if the awaits above never settle.
+function exitAfterDestroy(label) {
+  setTimeout(() => {
+    console.warn(`${label}: shutdown stalled, forcing exit.`);
+    process.exit(1);
+  }, DESTROY_TIMEOUT_MS + 5000).unref();
+
+  destroyWithTimeout().then((clean) => {
+    if (!clean) console.warn(`${label}: client.destroy() did not finish cleanly.`);
+    process.exit(1);
+  });
+}
+
 client.on('disconnected', async (reason) => {
   botReady = false;
   qrDataUrl = null;
@@ -152,9 +249,13 @@ client.on('disconnected', async (reason) => {
   await notify(`PingBot disconnected: ${reason}. Reconnecting…`);
 
   setTimeout(async () => {
-    try {
-      await client.destroy();
-    } catch (_) {}
+    const clean = await destroyWithTimeout();
+    if (!clean) {
+      // Reinitializing on top of a half-torn-down client leaks the old Chromium.
+      // Exit instead and let Railway give us a fresh container.
+      console.warn('Teardown timed out after disconnect — exiting for a clean restart.');
+      process.exit(1);
+    }
     client.initialize();
   }, 5000);
 });
@@ -473,8 +574,7 @@ function scheduleRestart() {
   setTimeout(async () => {
     console.log('Performing scheduled daily restart to reclaim memory…');
     await notify('PingBot: scheduled daily restart to reclaim memory.');
-    try { await client.destroy(); } catch (_) {}
-    process.exit(1);
+    exitAfterDestroy('Scheduled restart');
   }, msUntil);
 }
 scheduleRestart();
