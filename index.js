@@ -437,24 +437,39 @@ async function downloadMediaVerbose(msgId) {
         step.mediaStageAfterResolve = m.mediaData.mediaStage;
       }
 
-      step.at = 'require(WAWebDownloadManager)';
-      const dm = window.require('WAWebDownloadManager').downloadManager;
+      // Once resolved, WhatsApp already holds the decrypted file. Use it directly
+      // rather than downloading and decrypting a second time.
+      let decrypted = null;
+      const blob = m.mediaData.mediaBlob;
+      if (blob && typeof blob.forceToBlob === 'function') {
+        step.at = 'mediaBlob.forceToBlob';
+        decrypted = await blob.forceToBlob().arrayBuffer();
+      }
 
-      step.at = 'downloadAndMaybeDecrypt';
-      const mockQpl = {
-        addAnnotations() { return this; },
-        addPoint() { return this; },
-      };
-      const decrypted = await dm.downloadAndMaybeDecrypt({
-        directPath: m.directPath,
-        encFilehash: m.encFilehash,
-        filehash: m.filehash,
-        mediaKey: m.mediaKey,
-        mediaKeyTimestamp: m.mediaKeyTimestamp,
-        type: m.type,
-        signal: new AbortController().signal,
-        downloadQpl: mockQpl,
-      });
+      if (!decrypted) {
+        step.at = 'require(WAWebDownloadManager)';
+        const dm = window.require('WAWebDownloadManager').downloadManager;
+
+        step.at = 'downloadAndMaybeDecrypt';
+        const mockQpl = {
+          addAnnotations() { return this; },
+          addPoint() { return this; },
+        };
+        // The downloader now validates the mimetype against the media type and
+        // falls back to application/octet-stream when none is given, which it
+        // then rejects with InvalidMediaFileType.
+        decrypted = await dm.downloadAndMaybeDecrypt({
+          directPath: m.directPath,
+          encFilehash: m.encFilehash,
+          filehash: m.filehash,
+          mediaKey: m.mediaKey,
+          mediaKeyTimestamp: m.mediaKeyTimestamp,
+          mimetype: m.mimetype,
+          type: m.type,
+          signal: new AbortController().signal,
+          downloadQpl: mockQpl,
+        });
+      }
 
       step.at = 'arrayBufferToBase64Async';
       const data = await window.WWebJS.arrayBufferToBase64Async(decrypted);
