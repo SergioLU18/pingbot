@@ -1,88 +1,80 @@
-const http = require('http');
-const fs = require('fs');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
+import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
-const path = require('path');
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  downloadMediaMessage,
+  fetchLatestBaileysVersion,
+  normalizeMessageContent,
+  useMultiFileAuthState,
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import qrcode from 'qrcode';
+import sharp from 'sharp';
+import webpmux from 'node-webpmux';
 
-// Chromium's user data dir, which LocalAuth points at and Railway mounts as a volume.
-const SESSION_DIR = path.join('.wwebjs_auth', 'session');
+const execFileAsync = promisify(execFile);
 
-// Remove stale Chromium lock files left by a previous container instance
-['SingletonLock', 'SingletonCookie', 'SingletonSocket'].forEach((f) => {
-  try { fs.unlinkSync(path.join(SESSION_DIR, f)); } catch (_) {}
-});
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 
-// Caches Chromium rebuilds on demand. They survive restarts on the volume and get
-// paged back in at boot, so the RAM baseline ratchets upward with every restart
-// instead of returning to its floor. Nothing here is the WhatsApp session: the
-// auth credentials live in Default/IndexedDB and Default/Local Storage, which we
-// must leave alone or the bot logs out and needs a fresh QR scan.
-const DISPOSABLE_CACHES = [
-  'Default/Cache',
-  'Default/Code Cache',
-  'Default/GPUCache',
-  'Default/Service Worker/CacheStorage',
-  'Default/Service Worker/ScriptCache',
-  'Default/DawnGraphiteCache',
-  'Default/DawnWebGPUCache',
-  'GrShaderCache',
-  'ShaderCache',
-  'GraphiteDawnCache',
-];
+// Keep the session on the Railway volume (Railway sets RAILWAY_VOLUME_MOUNT_PATH)
+// so it survives redeploys without touching the volume settings.
+const VOLUME_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.wwebjs_auth';
+const AUTH_DIR = process.env.AUTH_DIR || path.join(VOLUME_DIR, 'baileys');
 
-function dirSize(target) {
-  let total = 0;
-  let entries;
-  try {
-    entries = fs.readdirSync(target, { withFileTypes: true });
-  } catch (_) {
-    return 0;
-  }
-  for (const entry of entries) {
-    const full = path.join(target, entry.name);
-    if (entry.isDirectory()) {
-      total += dirSize(full);
-    } else {
-      try { total += fs.statSync(full).size; } catch (_) {}
-    }
-  }
-  return total;
-}
-
-function pruneDisposableCaches() {
-  let reclaimed = 0;
-  for (const rel of DISPOSABLE_CACHES) {
-    const target = path.join(SESSION_DIR, ...rel.split('/'));
-    if (!fs.existsSync(target)) continue;
-    const size = dirSize(target);
-    try {
-      fs.rmSync(target, { recursive: true, force: true });
-      reclaimed += size;
-    } catch (err) {
-      console.warn(`Could not prune ${rel}:`, err && err.message);
-    }
-  }
-  console.log(`Pruned Chromium caches: reclaimed ${(reclaimed / 1048576).toFixed(1)} MB`);
-}
-
-pruneDisposableCaches();
-
-// Set this to your group's ID after running the bot once (it will be printed below).
-// Example: '120363000000000000@g.us'
+// Only answer in this group.
 const TARGET_GROUP_ID = '120363424943457623@g.us';
 
-// Optional: get a push notification on your phone when the bot disconnects.
-// 1. Install the ntfy app (ntfy.sh) on your phone
-// 2. Subscribe to a topic name of your choice (e.g. 'pingbot-alerts-yourname')
-// 3. Set NTFY_TOPIC to that topic name as a Railway environment variable
+const STICKER_NAME = 'PingBot';
+const STICKER_AUTHOR = 'ChichenIT';
+
+const RATE_LIMIT = 5;          // max stickers per window
+const RATE_WINDOW_MS = 60_000; // 1 minute
+
+// Refuse to download anything bigger than this — the whole file is held in memory.
+const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
+
+// Optional push notifications via ntfy.sh (set NTFY_TOPIC in Railway).
 const NTFY_TOPIC = process.env.NTFY_TOPIC || null;
+
+const logger = pino({ level: process.env.LOG_LEVEL || 'warn' });
+
+// ---------------------------------------------------------------------------
+// One-time cleanup of the old whatsapp-web.js Chromium profile on the volume
+// ---------------------------------------------------------------------------
+
+// The volume may be mounted at .wwebjs_auth (old data in ./session) or at
+// .wwebjs_auth/session itself (old Chromium profile at its root). Either way, if
+// we see the old profile, delete everything except the Baileys folder.
+const OLD_PROFILE_MARKERS = ['session', 'Default', 'Local State'];
+if (OLD_PROFILE_MARKERS.some((m) => fs.existsSync(path.join(VOLUME_DIR, m)))) {
+  for (const entry of fs.readdirSync(VOLUME_DIR)) {
+    if (entry === path.basename(AUTH_DIR)) continue;
+    try {
+      fs.rmSync(path.join(VOLUME_DIR, entry), { recursive: true, force: true });
+    } catch (err) {
+      console.warn(`Could not remove old ${entry}:`, err.message);
+    }
+  }
+  console.log(`Removed old whatsapp-web.js Chromium data from ${VOLUME_DIR}`);
+}
+fs.rmSync('.wwebjs_cache', { recursive: true, force: true });
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 async function notify(message) {
   if (!NTFY_TOPIC) return;
   try {
-    // Bounded: notify() sits on the restart path, and a stalled POST here would
-    // hold up the exit it is announcing.
     await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
       method: 'POST',
       body: message,
@@ -91,507 +83,358 @@ async function notify(message) {
   } catch (_) {}
 }
 
-const RATE_LIMIT = 5;        // max stickers per window
-const RATE_WINDOW_MS = 60_000; // 1 minute
-const rateLimits = new Map(); // userId -> { count, resetAt }
+const rateLimits = new Map(); // userJid -> { count, resetAt }
 
 setInterval(() => {
   const now = Date.now();
   for (const [userId, entry] of rateLimits) {
     if (now >= entry.resetAt) rateLimits.delete(userId);
   }
-}, RATE_WINDOW_MS);
+}, RATE_WINDOW_MS).unref();
 
 function isRateLimited(userId) {
   const now = Date.now();
   const entry = rateLimits.get(userId);
-
   if (!entry || now >= entry.resetAt) {
     rateLimits.set(userId, { count: 1, resetAt: now + RATE_WINDOW_MS });
     return false;
   }
-
   if (entry.count >= RATE_LIMIT) return true;
-
   entry.count++;
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Sticker conversion
+// ---------------------------------------------------------------------------
+
+// WhatsApp reads the pack name/author from a custom EXIF block inside the WebP.
+async function addStickerMetadata(webp) {
+  const json = {
+    'sticker-pack-id': crypto.randomBytes(16).toString('hex'),
+    'sticker-pack-name': STICKER_NAME,
+    'sticker-pack-publisher': STICKER_AUTHOR,
+    emojis: [''],
+  };
+  const exifAttr = Buffer.from([
+    0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57,
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00,
+  ]);
+  const jsonBuffer = Buffer.from(JSON.stringify(json), 'utf8');
+  const exif = Buffer.concat([exifAttr, jsonBuffer]);
+  exif.writeUIntLE(jsonBuffer.length, 14, 4);
+
+  const img = new webpmux.Image();
+  await img.load(webp);
+  img.exif = exif;
+  return img.save(null);
+}
+
+async function imageToWebp(buffer) {
+  const toWebp = (quality) =>
+    sharp(buffer, { animated: true })
+      .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .webp({ quality })
+      .toBuffer();
+
+  // WhatsApp rejects static stickers much over 100 KB.
+  let out = await toWebp(80);
+  if (out.length > 100 * 1024) out = await toWebp(50);
+  return out;
+}
+
+async function videoToWebp(buffer) {
+  const id = crypto.randomBytes(6).toString('hex');
+  const input = path.join(os.tmpdir(), `${id}.in`);
+  const output = path.join(os.tmpdir(), `${id}.webp`);
+  try {
+    fs.writeFileSync(input, buffer);
+    await execFileAsync('ffmpeg', [
+      '-y', '-i', input,
+      '-t', '5', '-an',
+      '-vf', "scale='iw*min(512/iw,512/ih)':'ih*min(512/iw,512/ih)',format=rgba," +
+             "pad=512:512:'(512-iw)/2':'(512-ih)/2':'#00000000',setsar=1,fps=10",
+      '-vcodec', 'libwebp', '-loop', '0', '-quality', '50',
+      output,
+    ], { timeout: 30_000 });
+    return fs.readFileSync(output);
+  } finally {
+    fs.rmSync(input, { force: true });
+    fs.rmSync(output, { force: true });
+  }
+}
+
+async function makeSticker(buffer, kind) {
+  const webp = kind === 'videoMessage' ? await videoToWebp(buffer) : await imageToWebp(buffer);
+  return addStickerMetadata(webp);
+}
+
+// ---------------------------------------------------------------------------
+// Message handling
+// ---------------------------------------------------------------------------
+
+const MEDIA_KINDS = ['imageMessage', 'videoMessage', 'stickerMessage'];
+
+function findMedia(content) {
+  if (!content) return null;
+  for (const kind of MEDIA_KINDS) {
+    if (content[kind]) return { kind, media: content[kind] };
+  }
+  return null;
+}
+
+function getText(content) {
+  if (!content) return '';
+  return (
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
+    ''
+  );
+}
+
+async function handleMessage(sock, msg) {
+  if (!msg.message || msg.key.fromMe) return;
+
+  const chatId = msg.key.remoteJid;
+  if (chatId !== TARGET_GROUP_ID) return;
+
+  const content = normalizeMessageContent(msg.message);
+  if (getText(content).trim().toLowerCase() !== '!sticker') return;
+
+  const reply = (payload) =>
+    sock.sendMessage(chatId, payload, { quoted: msg }).catch((err) => {
+      console.warn('Failed to reply:', err.message);
+    });
+
+  const sender = msg.key.participant || chatId;
+  if (isRateLimited(sender)) {
+    await reply({ text: `You've reached the limit of ${RATE_LIMIT} stickers per minute. Try again shortly.` });
+    return;
+  }
+
+  // 1. Media sent with "!sticker" as the caption.
+  let source = null;
+  const own = findMedia(content);
+  if (own) {
+    source = { ...own, message: msg };
+  } else {
+    // 2. "!sticker" sent as a reply to a media message. The quoted message carries
+    //    the media keys, so it can be downloaded without fetching the original.
+    const ctx = content.extendedTextMessage?.contextInfo;
+    const quoted = normalizeMessageContent(ctx?.quotedMessage);
+    const found = findMedia(quoted);
+    if (ctx && found) {
+      source = {
+        ...found,
+        message: {
+          key: { remoteJid: chatId, id: ctx.stanzaId, participant: ctx.participant, fromMe: false },
+          message: quoted,
+        },
+      };
+    } else if (ctx?.quotedMessage) {
+      await reply({ text: "That message doesn't have an image. Reply to an image with *!sticker*." });
+      return;
+    }
+  }
+
+  if (!source) {
+    await reply({ text: 'Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.' });
+    return;
+  }
+
+  const size = Number(source.media.fileLength || 0);
+  if (size > MAX_MEDIA_BYTES) {
+    await reply({ text: 'That file is too big to turn into a sticker.' });
+    return;
+  }
+
+  let buffer;
+  try {
+    buffer = await downloadMediaMessage(source.message, 'buffer', {}, {
+      logger,
+      // Re-requests the media from the sender's phone if WhatsApp's CDN expired it.
+      reuploadRequest: sock.updateMediaMessage,
+    });
+  } catch (err) {
+    console.warn('Media download failed:', err.message);
+    await reply({ text: "I couldn't download that image. Try sending it again as a new message." });
+    return;
+  }
+
+  let sticker;
+  try {
+    sticker = await makeSticker(buffer, source.kind);
+  } catch (err) {
+    console.warn('Sticker conversion failed:', err.message);
+    await reply({ text: "I couldn't turn that into a sticker." });
+    return;
+  }
+
+  await reply({ sticker });
+}
+
+// ---------------------------------------------------------------------------
+// Connection lifecycle
+// ---------------------------------------------------------------------------
+
 let qrDataUrl = null;
 let botReady = false;
+// True while logged out and waiting for someone to press "Generate QR".
+let idle = false;
+let sock = null;
+let reconnectDelay = 2000;
 
-// Serve the QR code as a web page so it can be scanned from the Railway URL
-const server = http.createServer(async (_req, res) => {
+// Group metadata is fetched on every send to a group unless cached.
+const groupCache = new Map();
+
+async function start() {
+  idle = false;
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    browser: Browsers.ubuntu('PingBot'),
+    // Don't request the full chat history. The small initial sync is left on (the
+    // default) because Baileys needs it for LID mappings; we never store it.
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+    getMessage: async () => undefined,
+    cachedGroupMetadata: async (jid) => groupCache.get(jid),
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('groups.update', (updates) => {
+    for (const u of updates) groupCache.delete(u.id);
+  });
+  sock.ev.on('group-participants.update', ({ id }) => groupCache.delete(id));
+
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      qrDataUrl = await qrcode.toDataURL(qr);
+      console.log('QR code ready. Open the app URL in your browser to scan it.');
+    }
+
+    if (connection === 'open') {
+      botReady = true;
+      qrDataUrl = null;
+      reconnectDelay = 2000;
+      console.log('Bot is ready!');
+      try {
+        groupCache.set(TARGET_GROUP_ID, await sock.groupMetadata(TARGET_GROUP_ID));
+      } catch (err) {
+        console.warn('Could not fetch target group metadata:', err.message);
+      }
+      return;
+    }
+
+    if (connection !== 'close') return;
+
+    botReady = false;
+    qrDataUrl = null;
+    const code = lastDisconnect?.error?.output?.statusCode;
+    const registered = !!state.creds.registered;
+
+    if (code === DisconnectReason.loggedOut) {
+      console.warn('Logged out — clearing session and waiting for "Generate QR".');
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      idle = true;
+      await notify('PingBot was logged out. Open the app URL and press "Generate QR".');
+      return;
+    }
+
+    if (!registered && code === DisconnectReason.timedOut) {
+      // Nobody scanned the QR in time. Stop generating new ones until asked.
+      console.warn('QR not scanned in time — idle until "Generate QR" is pressed.');
+      idle = true;
+      return;
+    }
+
+    // Anything else (restartRequired after pairing, network blips, etc.): reconnect.
+    const delay = code === DisconnectReason.restartRequired ? 0 : reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, 60_000);
+    console.warn(`Connection closed (code ${code}) — reconnecting in ${delay / 1000}s…`);
+    if (code !== DisconnectReason.restartRequired) {
+      await notify(`PingBot disconnected (code ${code}). Reconnecting…`);
+    }
+    setTimeout(() => start().catch((err) => console.error('Reconnect failed:', err)), delay);
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const msg of messages) {
+      try {
+        await handleMessage(sock, msg);
+      } catch (err) {
+        console.error('Error handling message:', err && err.stack);
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Web page: QR code / status / "Generate QR" button
+// ---------------------------------------------------------------------------
+
+const page = (body) =>
+  `<html><body style="font-family:sans-serif;text-align:center;padding:50px">${body}</body></html>`;
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/start') {
+    if (idle) {
+      console.log('Start requested from web page.');
+      start().catch((err) => {
+        console.error('Start failed:', err);
+        idle = true;
+      });
+    }
+    res.writeHead(303, { Location: '/' });
+    res.end();
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/html' });
 
   if (botReady) {
-    res.end('<html><body style="font-family:sans-serif;text-align:center;padding:50px"><h1>Bot is connected and running!</h1></body></html>');
-    return;
+    res.end(page('<h1>Bot is connected and running!</h1>'));
+  } else if (idle) {
+    res.end(page(`<h1>Bot is logged out</h1>
+      <p>Press the button when you are ready to scan.</p>
+      <form method="POST" action="/start"><button style="font-size:20px;padding:12px 24px">Generate QR</button></form>`));
+  } else if (qrDataUrl) {
+    res.end(`<html><body style="background:#111;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+      <div style="text-align:center">
+        <h2 style="color:white;font-family:sans-serif">Scan with WhatsApp to connect the bot</h2>
+        <img src="${qrDataUrl}" style="width:300px;height:300px;border-radius:12px">
+        <meta http-equiv="refresh" content="20">
+      </div>
+    </body></html>`);
+  } else {
+    res.end(page('<h1>Connecting…</h1><meta http-equiv="refresh" content="3">'));
   }
-
-  if (!qrDataUrl) {
-    res.end('<html><body style="font-family:sans-serif;text-align:center;padding:50px"><h1>Waiting for QR code...</h1><meta http-equiv="refresh" content="3"></body></html>');
-    return;
-  }
-
-  res.end(`<html><body style="background:#111;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-    <div style="text-align:center">
-      <h2 style="color:white;font-family:sans-serif">Scan with WhatsApp to connect the bot</h2>
-      <img src="${qrDataUrl}" style="width:300px;height:300px;border-radius:12px">
-      <meta http-equiv="refresh" content="30">
-    </div>
-  </body></html>`);
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`QR server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`Web server listening on port ${PORT}`));
 
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--no-zygote',
-      // Reduce background CPU/network activity
-      '--disable-background-networking',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--disable-sync',
-      '--disable-default-apps',
-      '--no-first-run',
-      '--no-pings',
-      // Cap disk and media caches to ~32 MB each
-      '--disk-cache-size=33554432',
-      '--media-cache-size=33554432',
-      // Cap V8 heap to 256 MB so Chrome doesn't grow unbounded
-      '--js-flags=--max-old-space-size=256',
-      '--renderer-process-limit=1',
-      // Misc hardening
-      '--mute-audio',
-      '--disable-notifications',
-      '--disable-breakpad',
-      '--disable-client-side-phishing-detection',
-      '--disable-component-extensions-with-background-pages',
-      '--disable-domain-reliability',
-      '--metrics-recording-only',
-      '--password-store=basic',
-      '--use-mock-keychain',
-    ],
-  },
-});
-
-client.on('qr', async (qr) => {
-  qrDataUrl = await qrcode.toDataURL(qr);
-  console.log('QR code ready. Open the app URL in your browser to scan it.');
-});
-
-client.on('ready', async () => {
-  botReady = true;
-  qrDataUrl = null;
-  console.log('Bot is ready!');
-
-  await probeWhatsAppPage();
-
-  if (!TARGET_GROUP_ID) {
-    const chats = await client.getChats();
-    const groups = chats.filter((c) => c.isGroup);
-    if (groups.length === 0) {
-      console.log('No groups found. Create a group and add the bot number first.');
-    } else {
-      console.log('Groups found:');
-      groups.forEach((g) => console.log(`  "${g.name}" → ${g.id._serialized}`));
-      console.log('Copy your group ID into TARGET_GROUP_ID in index.js');
-    }
-  }
-});
-
-// client.destroy() ends in puppeteer's browser.close(), which can hang forever on a
-// wedged Chromium. Anything sequenced after a bare `await client.destroy()` may then
-// never run. Always race it against a deadline.
-const DESTROY_TIMEOUT_MS = 10_000;
-
-async function destroyWithTimeout() {
-  let timer;
-  const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(false), DESTROY_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([client.destroy().then(() => true, () => false), deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Exit no matter what, so Railway rebuilds the container from a clean slate.
-// The unref'd timer fires even if the awaits above never settle.
-function exitAfterDestroy(label) {
-  setTimeout(() => {
-    console.warn(`${label}: shutdown stalled, forcing exit.`);
-    process.exit(1);
-  }, DESTROY_TIMEOUT_MS + 5000).unref();
-
-  destroyWithTimeout().then((clean) => {
-    if (!clean) console.warn(`${label}: client.destroy() did not finish cleanly.`);
-    process.exit(1);
-  });
-}
-
-client.on('disconnected', async (reason) => {
-  botReady = false;
-  qrDataUrl = null;
-  console.warn('Bot disconnected:', reason, '— reinitializing in 5s…');
-  await notify(`PingBot disconnected: ${reason}. Reconnecting…`);
-
-  setTimeout(async () => {
-    const clean = await destroyWithTimeout();
-    if (!clean) {
-      // Reinitializing on top of a half-torn-down client leaks the old Chromium.
-      // Exit instead and let Railway give us a fresh container.
-      console.warn('Teardown timed out after disconnect — exiting for a clean restart.');
-      process.exit(1);
-    }
-    client.initialize();
-  }, 5000);
-});
-
-client.on('auth_failure', async (msg) => {
-  console.error('Authentication failed:', msg);
-  await notify(`PingBot auth failure: ${msg}`);
-});
-
-// Errors that cross the puppeteer page boundary lose most of their detail and
-// their class names are minified. Print every own property so the cause is visible.
-function describeError(err) {
-  if (!err) return String(err);
-  const parts = [`${err.name || 'Error'}: ${err.message || '(no message)'}`];
-  for (const key of Object.getOwnPropertyNames(err)) {
-    if (key === 'name' || key === 'message' || key === 'stack') continue;
-    let value;
-    try { value = JSON.stringify(err[key]); } catch (_) { value = '(unserializable)'; }
-    parts.push(`${key}=${value}`);
-  }
-  if (err.stack) parts.push(`\n${err.stack}`);
-  return parts.join(' ');
-}
-
-// Modules whatsapp-web.js pulls out of the WhatsApp Web bundle for our two code
-// paths. If WhatsApp renames or drops one, window.require throws a minified error.
-const REQUIRED_MODULES = [
-  'WAWebCollections',
-  'WAWebQuotedMsgModelUtils',
-  'WAWebDownloadManager',
-  'WAWebMsgKey',
-];
-
-// Runs once the page is live: reports the served WhatsApp Web version and whether
-// each module the library depends on still resolves.
-async function probeWhatsAppPage() {
-  try {
-    const report = await client.pupPage.evaluate((mods) => {
-      const out = {
-        waVersion: (window.Debug && window.Debug.VERSION) || '(unknown)',
-        typeofRequire: typeof window.require,
-        typeofWWebJS: typeof window.WWebJS,
-        modules: {},
-      };
-      for (const name of mods) {
-        try {
-          const mod = window.require(name);
-          out.modules[name] = mod
-            ? `ok [${Object.keys(mod).slice(0, 6).join(', ')}]`
-            : 'resolved but empty';
-        } catch (e) {
-          out.modules[name] = `THREW ${e && e.name}: ${e && e.message}`;
-        }
-      }
-      return out;
-    }, REQUIRED_MODULES);
-    console.log('WhatsApp Web page probe:', JSON.stringify(report, null, 2));
-  } catch (err) {
-    console.warn('Page probe failed:', describeError(err));
-  }
-}
-
-// WhatsApp's message keys reach us in several shapes, and current versions no
-// longer include `_serialized` on the object hung off a Message. Rebuild it from
-// its parts when it's missing: fromMe_remote_id[_participant].
-function serializeMsgId(id) {
-  if (!id) return null;
-  if (typeof id === 'string') return id;
-  if (id._serialized) return id._serialized;
-
-  const flatten = (v) => (v && typeof v === 'object' ? v._serialized : v);
-  const remote = flatten(id.remote);
-  if (!remote || !id.id) return null;
-
-  const parts = [id.fromMe ? 'true' : 'false', remote, id.id];
-  const participant = flatten(id.participant);
-  if (participant) parts.push(participant);
-  return parts.join('_');
-}
-
-// Resolves a reply to the ID of the message it quotes.
-//
-// We deliberately avoid the library's getQuotedMessage(): it ends by calling
-// WWebJS.getMessageModel(), which runs message.serialize(), link parsing and
-// button serialization to build a full Message object. That is a lot of surface
-// for data we don't need, and something in it throws a minified error ("r").
-// All we want is the ID, which we then hand straight to the downloader.
-async function getQuotedMediaId(msgId) {
-  return client.pupPage.evaluate(async (id) => {
-    const step = { at: 'start' };
-    try {
-      step.at = 'require(WAWebCollections)';
-      const Collections = window.require('WAWebCollections');
-
-      step.at = 'validate id';
-      if (typeof id !== 'string' || !id) {
-        return { ok: false, reason: `bad message id: ${JSON.stringify(id)}`, step };
-      }
-
-      step.at = 'Msg.get';
-      let m = Collections.Msg.get(id);
-      if (!m) {
-        step.at = 'Msg.getMessagesById';
-        // getMessagesById indexes IndexedDB by MsgKey object, not by the
-        // serialized string — passing the string looks up an undefined key
-        // and IndexedDB throws DataError.
-        const key = window.require('WAWebMsgKey').fromString(id);
-        m = (await Collections.Msg.getMessagesById([key]))?.messages?.[0];
-      }
-      if (!m) return { ok: false, reason: 'message not found in store', step };
-
-      step.at = 'getQuotedMsgObj';
-      const quoted = window.require('WAWebQuotedMsgModelUtils').getQuotedMsgObj(m);
-      if (!quoted) return { ok: false, reason: 'no quoted message', step };
-
-      step.at = 'read quoted id';
-      const flatten = (v) => (v && typeof v === 'object' ? v._serialized : v);
-      const qid = quoted.id;
-      let serialized = null;
-      if (typeof qid === 'string') {
-        serialized = qid;
-      } else if (qid && qid._serialized) {
-        serialized = qid._serialized;
-      } else if (qid && flatten(qid.remote) && qid.id) {
-        const parts = [qid.fromMe ? 'true' : 'false', flatten(qid.remote), qid.id];
-        if (flatten(qid.participant)) parts.push(flatten(qid.participant));
-        serialized = parts.join('_');
-      }
-
-      return {
-        ok: true,
-        id: serialized,
-        idShape: qid ? Object.keys(qid).join(',') : String(qid),
-        type: quoted.type,
-        hasMedia: Boolean(quoted.mediaData || quoted.mediaKey),
-      };
-    } catch (e) {
-      return {
-        ok: false,
-        reason: 'threw',
-        step,
-        error: {
-          name: e && e.name,
-          message: e && e.message,
-          stack: e && e.stack ? String(e.stack).split('\n').slice(0, 6).join(' | ') : null,
-        },
-      };
-    }
-  }, msgId);
-}
-
-// Mirrors the library's downloadMedia, but catches inside the page so the real
-// (un-minified) error message and stack survive instead of collapsing to "r".
-async function downloadMediaVerbose(msgId) {
-  return client.pupPage.evaluate(async (msgId) => {
-    const step = { at: 'start' };
-    try {
-      step.at = 'require(WAWebCollections)';
-      const Collections = window.require('WAWebCollections');
-
-      step.at = 'Msg.get';
-      let m = Collections.Msg.get(msgId);
-      if (!m) {
-        step.at = 'Msg.getMessagesById';
-        // Must be a MsgKey object — see the note in getQuotedMediaId.
-        const key = window.require('WAWebMsgKey').fromString(msgId);
-        m = (await Collections.Msg.getMessagesById([key]))?.messages?.[0];
-      }
-      if (!m) return { ok: false, reason: 'message not found in store', step };
-
-      step.at = 'read mediaData';
-      step.mediaStage = m.mediaData && m.mediaData.mediaStage;
-      step.type = m.type;
-      if (!m.mediaData) return { ok: false, reason: 'no mediaData', step };
-
-      if (step.mediaStage !== 'RESOLVED') {
-        step.at = 'msg.downloadMedia (resolve)';
-        await m.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
-        step.mediaStageAfterResolve = m.mediaData.mediaStage;
-      }
-
-      // Once resolved, WhatsApp already holds the decrypted file. Use it directly
-      // rather than downloading and decrypting a second time.
-      let decrypted = null;
-      const blob = m.mediaData.mediaBlob;
-      if (blob && typeof blob.forceToBlob === 'function') {
-        step.at = 'mediaBlob.forceToBlob';
-        decrypted = await blob.forceToBlob().arrayBuffer();
-      }
-
-      if (!decrypted) {
-        step.at = 'require(WAWebDownloadManager)';
-        const dm = window.require('WAWebDownloadManager').downloadManager;
-
-        step.at = 'downloadAndMaybeDecrypt';
-        const mockQpl = {
-          addAnnotations() { return this; },
-          addPoint() { return this; },
-        };
-        // The downloader now validates the mimetype against the media type and
-        // falls back to application/octet-stream when none is given, which it
-        // then rejects with InvalidMediaFileType.
-        decrypted = await dm.downloadAndMaybeDecrypt({
-          directPath: m.directPath,
-          encFilehash: m.encFilehash,
-          filehash: m.filehash,
-          mediaKey: m.mediaKey,
-          mediaKeyTimestamp: m.mediaKeyTimestamp,
-          mimetype: m.mimetype,
-          type: m.type,
-          signal: new AbortController().signal,
-          downloadQpl: mockQpl,
-        });
-      }
-
-      step.at = 'arrayBufferToBase64Async';
-      const data = await window.WWebJS.arrayBufferToBase64Async(decrypted);
-
-      return { ok: true, data, mimetype: m.mimetype, filename: m.filename, filesize: m.size };
-    } catch (e) {
-      return {
-        ok: false,
-        reason: 'threw',
-        step,
-        error: {
-          name: e && e.name,
-          message: e && e.message,
-          status: e && e.status,
-          stack: e && e.stack ? String(e.stack).split('\n').slice(0, 6).join(' | ') : null,
-          keys: e ? Object.getOwnPropertyNames(e).join(',') : null,
-        },
-      };
-    }
-  }, msgId);
-}
-
-// Safely reply without letting a send failure bubble up as an unhandled rejection.
-async function safeReply(msg, content, options) {
-  try {
-    await msg.reply(content, null, options);
-  } catch (err) {
-    console.warn('Failed to reply:', err && err.message);
-  }
-}
-
-client.on('message_create', async (msg) => {
-  try {
-    if (msg.fromMe) return;
-    if (msg.body.trim().toLowerCase() !== '!sticker') return;
-    if (TARGET_GROUP_ID && msg.from !== TARGET_GROUP_ID && msg.to !== TARGET_GROUP_ID) return;
-    if (isRateLimited(msg.author || msg.from)) {
-      await safeReply(msg, 'You\'ve reached the limit of 5 stickers per minute. Try again shortly.');
-      return;
-    }
-
-    // Work in terms of message IDs, not Message objects. Building a Message means
-    // going through WWebJS.getMessageModel(), which is the part that throws.
-    const ownId = serializeMsgId(msg.id);
-
-    if (!ownId) {
-      console.warn('Could not derive an id for the incoming message:', JSON.stringify({
-        id: msg.id,
-        hasMedia: msg.hasMedia,
-        hasQuotedMsg: msg.hasQuotedMsg,
-        dataIdShape: msg._data && msg._data.id ? Object.keys(msg._data.id).join(',') : null,
-      }, null, 2));
-      await safeReply(msg, 'Something went wrong reading that message. Try again.');
-      return;
-    }
-
-    let sourceId = msg.hasMedia ? ownId : null;
-
-    if (!sourceId && msg.hasQuotedMsg) {
-      const quoted = await getQuotedMediaId(ownId);
-      if (!quoted.ok || !quoted.id) {
-        console.warn('Could not resolve quoted message:', JSON.stringify(quoted, null, 2));
-        await safeReply(msg, 'I couldn\'t read the message you replied to. Try sending the image directly with *!sticker* as the caption.');
-        return;
-      }
-      if (!quoted.hasMedia) {
-        await safeReply(msg, 'That message doesn\'t have an image. Reply to an image with *!sticker*.');
-        return;
-      }
-      sourceId = quoted.id;
-    }
-
-    if (!sourceId) {
-      await safeReply(msg, 'Send an image with *!sticker* as the caption, or reply to an image with *!sticker*.');
-      return;
-    }
-
-    const result = await downloadMediaVerbose(sourceId);
-
-    if (!result || !result.ok) {
-      console.warn('Media download failed:', JSON.stringify(result, null, 2));
-      await safeReply(msg, 'I couldn\'t download that image. Try sending it again as a new message.');
-      return;
-    }
-
-    const media = new MessageMedia(result.mimetype, result.data, result.filename, result.filesize);
-
-    await safeReply(msg, media, {
-      sendMediaAsSticker: true,
-      stickerName: 'PingBot',
-      stickerAuthor: 'ChichenIT',
-    });
-  } catch (err) {
-    console.error('Error handling message:', err && err.stack);
-  }
-});
-
-// Last-resort guards. A rejected promise from puppeteer/whatsapp-web.js internals
-// should never take the whole bot down — log it and keep running.
+// Last-resort guards: log and keep running.
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection:', reason && (reason.stack || reason.message || reason));
 });
-
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err && (err.stack || err.message));
 });
 
-// Schedule a daily restart at 04:00 UTC to prevent Chromium memory buildup.
-// Railway will automatically restart the container on exit.
-function scheduleRestart() {
-  const now = new Date();
-  const next = new Date();
-  next.setUTCHours(4, 0, 0, 0);
-  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-  const msUntil = next - now;
-  console.log(`Scheduled restart in ${Math.round(msUntil / 60000)} min (04:00 UTC)`);
-  setTimeout(async () => {
-    console.log('Performing scheduled daily restart to reclaim memory…');
-    await notify('PingBot: scheduled daily restart to reclaim memory.');
-    exitAfterDestroy('Scheduled restart');
-  }, msUntil);
+// No saved session → don't generate QRs nobody is looking at; wait for the button.
+if (fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+  start().catch((err) => console.error('Start failed:', err));
+} else {
+  idle = true;
+  console.log('No saved WhatsApp session — open the app URL and press "Generate QR".');
 }
-scheduleRestart();
-
-client.initialize();
