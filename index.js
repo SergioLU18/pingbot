@@ -116,12 +116,13 @@ function isRateLimited(userId) {
 // ---------------------------------------------------------------------------
 
 // WhatsApp reads the pack name/author from a custom EXIF block inside the WebP.
-async function addStickerMetadata(webp) {
+async function addStickerMetadata(webp, extra = {}) {
   const json = {
     'sticker-pack-id': crypto.randomBytes(16).toString('hex'),
     'sticker-pack-name': STICKER_NAME,
     'sticker-pack-publisher': STICKER_AUTHOR,
     emojis: [''],
+    ...extra,
   };
   const exifAttr = Buffer.from([
     0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57,
@@ -150,14 +151,16 @@ async function imageToWebp(buffer) {
   return out;
 }
 
-async function videoToWebp(buffer, { seconds = 5, fps = 10, quality = 50 } = {}) {
+// stillImage: the input is a single picture, repeated for `seconds` to make an
+// animation (sound stickers need to be animated).
+async function videoToWebp(buffer, { seconds = 5, fps = 10, quality = 50, stillImage = false } = {}) {
   const id = crypto.randomBytes(6).toString('hex');
   const input = path.join(os.tmpdir(), `${id}.in`);
   const output = path.join(os.tmpdir(), `${id}.webp`);
   try {
     fs.writeFileSync(input, buffer);
     await execFileAsync('ffmpeg', [
-      '-y', '-i', input,
+      '-y', ...(stillImage ? ['-loop', '1'] : []), '-i', input,
       '-t', String(seconds), '-an',
       '-vf', "scale='iw*min(512/iw,512/ih)':'ih*min(512/iw,512/ih)',format=rgba," +
              `pad=512:512:'(512-iw)/2':'(512-ih)/2':'#00000000',setsar=1,fps=${fps}`,
@@ -180,55 +183,138 @@ async function makeSticker(buffer, kind) {
 // Sound stickers
 // ---------------------------------------------------------------------------
 //
-// WhatsApp's new "sound stickers" are not in Baileys' proto yet. Their shape, as
-// worked out by other open-source bots (unofficial and may change):
-//
-//   Message.audioStickerMessage (field 134): FutureProofMessage
-//     .message (field 1): Message
-//       .stickerMessage (field 26): StickerMessage
-//         .audioMessage (field 26): AudioMessage
-//
-// We encode the inner part by hand and append it to the outer message when Baileys
-// encodes it. The outer message then has no media field Baileys knows about, so it
-// goes out as stanza type "text", which is what phones are reported to accept.
+// WhatsApp's new "sound stickers" are not in Baileys' proto yet. This follows the
+// Baileys forks that support them (plogme, AunuBaileys); unofficial, may change:
+//   - a normal Message.stickerMessage, carrying the sound as
+//     StickerMessage.audioMessage (field 26, an AudioMessage), and
+//   - the WebP's EXIF JSON has "sound-sha256": hex SHA-256 of the audio file,
+//     which is how the receiving phone pairs the sticker with its sound.
+// Phones may also wrap one in Message field 134 (a FutureProofMessage holding a
+// Message) — we unwrap that on receive.
 
-function lengthDelimited(fieldNumber, bytes) {
-  const varint = (n) => {
-    const out = [];
-    while (n > 127) {
-      out.push((n & 127) | 128);
-      n >>>= 7;
-    }
-    out.push(n);
-    return out;
-  };
-  const tag = (fieldNumber << 3) | 2;
-  return Buffer.concat([Buffer.from([...varint(tag), ...varint(bytes.length)]), Buffer.from(bytes)]);
-}
+// StickerMessage objects we send -> their AudioMessage. Appended on encode, since
+// Baileys' encoder doesn't know field 26.
+const stickerAudio = new WeakMap();
 
-// Message objects that carry a sound sticker -> encoded FutureProofMessage bytes.
-const soundStickerPayloads = new WeakMap();
-
-const encodeMessage = proto.Message.encode;
-proto.Message.encode = function (message, writer) {
-  const w = encodeMessage.call(this, message, writer);
-  const payload = message && soundStickerPayloads.get(message);
-  if (payload) w.uint32((134 << 3) | 2).bytes(payload);
+const encodeSticker = proto.Message.StickerMessage.encode;
+proto.Message.StickerMessage.encode = function (message, writer) {
+  const w = encodeSticker.call(this, message, writer);
+  const audio = message && stickerAudio.get(message);
+  if (audio) proto.Message.AudioMessage.encode(audio, w.uint32((26 << 3) | 2).fork()).ldelim();
   return w;
 };
 
-function buildSoundStickerMessage(stickerMessage, audioMessage) {
-  const audioBytes = proto.Message.AudioMessage.encode(audioMessage).finish();
-  const stickerBytes = Buffer.concat([
-    proto.Message.StickerMessage.encode(stickerMessage).finish(),
-    lengthDelimited(26, audioBytes),
-  ]);
-  const message = proto.Message.create({
-    messageContextInfo: { messageSecret: crypto.randomBytes(32) },
-  });
-  soundStickerPayloads.set(message, lengthDelimited(1, lengthDelimited(26, stickerBytes)));
-  return message;
+// Minimal protobuf reader: top-level fields of a buffer, or null if it isn't one.
+function readFields(buf) {
+  const fields = [];
+  let i = 0;
+  const varint = () => {
+    let v = 0;
+    let shift = 0;
+    let b;
+    do {
+      if (i >= buf.length) throw new Error('eof');
+      b = buf[i++];
+      v += (b & 127) * 2 ** shift;
+      shift += 7;
+    } while (b & 128);
+    return v;
+  };
+  try {
+    while (i < buf.length) {
+      const tag = varint();
+      const field = Math.floor(tag / 8);
+      const type = tag & 7;
+      if (type === 0) fields.push({ field, value: varint() });
+      else if (type === 2) {
+        const len = varint();
+        if (i + len > buf.length) return null;
+        fields.push({ field, bytes: buf.subarray(i, i + len) });
+        i += len;
+      } else if (type === 1) { fields.push({ field, bytes: buf.subarray(i, i + 8) }); i += 8; }
+      else if (type === 5) { fields.push({ field, bytes: buf.subarray(i, i + 4) }); i += 4; }
+      else return null;
+    }
+  } catch {
+    return null;
+  }
+  return fields;
 }
+
+const getField = (fields, n) => fields?.find((f) => f.field === n)?.bytes;
+
+// "5:len32 'audio/ogg; codecs=opus', 13:1, ..." — field numbers and sizes, plus short
+// label-like strings (mimetypes). No URLs, keys or text.
+function describeFields(fields) {
+  return (fields || []).map((f) => {
+    if (f.bytes === undefined) return `${f.field}:${f.value}`;
+    const s = Buffer.from(f.bytes).toString('latin1');
+    return /^[\w/;=. -]{1,40}$/.test(s) && /[a-z]/.test(s) && !/^[A-Za-z0-9+/=]{20,}$/.test(s)
+      ? `${f.field}:'${s}'`
+      : `${f.field}:len${f.bytes.length}`;
+  }).join(', ');
+}
+
+// Set DEBUG_STICKERS=1 to log the structure of sound stickers the bot receives.
+const DEBUG_STICKERS = process.env.DEBUG_STICKERS === '1';
+
+// StickerMessage objects (from decode) that came with a sound.
+const receivedSoundStickers = new WeakSet();
+
+// Debug: log the EXIF JSON inside a received sound sticker's WebP.
+async function logStickerExif(sock, msg, stickerMessage) {
+  try {
+    const webp = await downloadMediaMessage(
+      { key: msg.key, message: { stickerMessage } }, 'buffer', {},
+      { logger, reuploadRequest: sock.updateMediaMessage },
+    );
+    const img = new webpmux.Image();
+    await img.load(webp);
+    const exif = img.exif ? Buffer.from(img.exif) : null;
+    const start = exif ? exif.indexOf('{') : -1;
+    console.log('[sound sticker] EXIF:', start >= 0 ? exif.subarray(start).toString('utf8') : '(none)');
+  } catch (err) {
+    console.warn('[sound sticker] EXIF read failed:', err.message);
+  }
+}
+
+const decodeMessage = proto.Message.decode;
+proto.Message.decode = function (reader, length) {
+  const message = decodeMessage.call(this, reader, length);
+  // Only top-level decodes get a raw buffer; nested ones get a protobuf Reader.
+  if (!(reader instanceof Uint8Array)) return message;
+  try {
+    let top = readFields(reader);
+    let target = message;
+    // Disappearing-messages chats wrap everything in ephemeralMessage (40).message (1).
+    const ephemeral = readFields(getField(readFields(getField(top, 40)), 1));
+    if (ephemeral && message.ephemeralMessage?.message) {
+      top = ephemeral;
+      target = message.ephemeralMessage.message;
+    }
+    const wrapped = readFields(getField(readFields(getField(top, 134)), 1));
+    const stickerBytes = getField(top, 26) || getField(wrapped, 26);
+    if (!stickerBytes) return message;
+    const sticker = readFields(stickerBytes);
+    const audio = readFields(getField(sticker, 26));
+    if (!audio && !wrapped) return message;
+
+    // Let the rest of the bot see a wrapped sound sticker as a normal sticker.
+    if (!target.stickerMessage) target.stickerMessage = proto.Message.StickerMessage.decode(stickerBytes);
+    receivedSoundStickers.add(target.stickerMessage);
+
+    if (DEBUG_STICKERS) {
+      console.log('[sound sticker] received');
+      console.log('  message fields:', top.map((f) => f.field).join(', '));
+      if (wrapped) console.log('  wrapped in 134, inner message fields:', wrapped.map((f) => f.field).join(', '));
+      console.log('  sticker:', describeFields(sticker));
+      console.log('  audio:', describeFields(audio));
+    }
+  } catch (err) {
+    console.warn('Sound sticker inspection failed:', err.message);
+  }
+  return message;
+};
 
 // 64 bars, 0–100, like the waveform WhatsApp shows for voice notes.
 function waveformFromPcm(pcm, bars = 64) {
@@ -288,12 +374,16 @@ async function toOggOpus(buffer) {
   }
 }
 
-// The animated WebP must stay small, so step quality and frame rate down until it fits.
-async function makeSoundStickerWebp(buffer, kind) {
-  if (kind !== 'videoMessage') return addStickerMetadata(await imageToWebp(buffer));
-  for (const opts of [{ fps: 10, quality: 50 }, { fps: 8, quality: 35 }, { fps: 6, quality: 20 }]) {
-    const webp = await videoToWebp(buffer, { seconds: SOUND_MAX_SECONDS, ...opts });
-    if (webp.length <= SOUND_MAX_WEBP_BYTES) return addStickerMetadata(webp);
+// Always animated (a still image becomes a slow loop of itself). The WebP must stay
+// small, so step quality and frame rate down until it fits. Returns null if it can't.
+async function makeSoundStickerWebp(buffer, kind, sound) {
+  const exif = { 'sound-sha256': crypto.createHash('sha256').update(sound.ogg).digest('hex') };
+  const attempts = kind === 'videoMessage'
+    ? [{ fps: 10, quality: 50 }, { fps: 8, quality: 35 }, { fps: 6, quality: 20 }]
+    : [{ fps: 2, quality: 60, stillImage: true }, { fps: 1, quality: 40, stillImage: true }];
+  for (const opts of attempts) {
+    const webp = await videoToWebp(buffer, { seconds: Math.min(sound.seconds, SOUND_MAX_SECONDS), ...opts });
+    if (webp.length <= SOUND_MAX_WEBP_BYTES) return addStickerMetadata(webp, exif);
   }
   return null;
 }
@@ -330,6 +420,9 @@ async function handleMessage(sock, msg) {
   if (chatId !== TARGET_GROUP_ID) return;
 
   const content = normalizeMessageContent(msg.message);
+  if (DEBUG_STICKERS && content?.stickerMessage && receivedSoundStickers.has(content.stickerMessage)) {
+    await logStickerExif(sock, msg, content.stickerMessage);
+  }
   const command = getText(content).trim().toLowerCase();
   if (command !== '!sticker' && command !== '!soundsticker') return;
 
@@ -482,7 +575,7 @@ async function handleSoundSticker(sock, msg, content, reply) {
   try {
     // One ffmpeg at a time to keep peak memory low.
     sound = await toOggOpus(audioBuffer);
-    if (sound) webp = await makeSoundStickerWebp(visualBuffer, visual.kind);
+    if (sound) webp = await makeSoundStickerWebp(visualBuffer, visual.kind, sound);
   } catch (err) {
     console.warn('Sound sticker conversion failed:', err.message);
     await reply({ text: "I couldn't turn that into a sound sticker." });
@@ -500,10 +593,9 @@ async function handleSoundSticker(sock, msg, content, reply) {
   }
 
   try {
-    const isAnimated = ((await sharp(webp, { animated: true }).metadata()).pages || 1) > 1;
     const uploadOpts = { upload: sock.waUploadToServer, logger };
     const [{ stickerMessage }, { audioMessage }] = await Promise.all([
-      prepareWAMessageMedia({ sticker: webp }, uploadOpts),
+      prepareWAMessageMedia({ sticker: webp, isAnimated: true }, uploadOpts),
       prepareWAMessageMedia({
         audio: sound.ogg,
         mimetype: 'audio/ogg; codecs=opus',
@@ -516,7 +608,9 @@ async function handleSoundSticker(sock, msg, content, reply) {
     Object.assign(stickerMessage, {
       width: 512,
       height: 512,
-      isAnimated,
+      isAnimated: true,
+      isLottie: false,
+      stickerSentTs: Date.now(),
       contextInfo: {
         stanzaId: msg.key.id,
         participant: msg.key.participant,
@@ -527,7 +621,8 @@ async function handleSoundSticker(sock, msg, content, reply) {
       },
     });
 
-    await sock.relayMessage(chatId, buildSoundStickerMessage(stickerMessage, audioMessage), {});
+    stickerAudio.set(stickerMessage, audioMessage);
+    await sock.relayMessage(chatId, proto.Message.create({ stickerMessage }), {});
   } catch (err) {
     console.warn('Sound sticker send failed:', err.message);
     await reply({ text: "I couldn't send the sound sticker." });
